@@ -1,8 +1,0 @@
-import http from 'node:http';import net from 'node:net';import {publicAddress,validateUrl} from './safety.mjs';
-// Every connection resolves once, validates all answers, and connects to the validated
-// address. Redirects and subresources cannot bypass private-network restrictions.
-export async function startProxy(){
- const server=http.createServer(async(req,res)=>{try{const u=validateUrl(req.url);if(u.protocol!=='http:')throw new Error('Use CONNECT for TLS');const addr=await publicAddress(u.hostname);const upstream=http.request({hostname:addr.address,family:addr.family,port:80,path:u.pathname+u.search,method:req.method,headers:{...req.headers,host:u.host}},r=>{res.writeHead(r.statusCode,r.headers);r.pipe(res);});upstream.on('error',()=>{if(!res.headersSent)res.writeHead(502);res.end();});req.pipe(upstream);}catch{res.writeHead(403);res.end('Network policy blocked this destination');}});
- server.on('connect',async(req,socket,head)=>{try{const u=validateUrl('https://'+req.url);if(!req.url.endsWith(':443'))throw new Error('Unsupported port');const addr=await publicAddress(u.hostname);const upstream=net.connect({host:addr.address,port:443,family:addr.family},()=>{socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');if(head.length)upstream.write(head);socket.pipe(upstream);upstream.pipe(socket);});upstream.on('error',()=>socket.destroy());socket.on('error',()=>upstream.destroy());socket.on('close',()=>upstream.destroy());}catch{socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');}});
- await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));return {server,url:'http://127.0.0.1:'+server.address().port};
-}
