@@ -2,7 +2,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {destinationMatches,classifyControl,canNavigate,consequential} from './safety.mjs';
 export async function probe(browser,monitor,egress,artifactDir){
  const start=Date.now(),options=monitor.options||{},timeout=options.timeoutMs||30000,maxClicks=options.maxClicks||8,maxDepth=options.maxDepth||2;
- const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],redirects:[],coverage:{attempted:0,passed:0,failed:0,warnings:0,reviewed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:6};
+ const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],redirects:[],coverage:{attempted:0,passed:0,failed:0,warnings:0,reviewed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:7};
  const add=(type,message,extra={})=>{if(run.events.length<4000)run.events.push({at:Date.now()-start,type,message:String(message).slice(0,3000),...extra});else run.coverage.truncated=true;};
  const issue=(severity,code,message,url,step)=>{if(run.issues.length<200&&!run.issues.some(i=>i.code===code&&i.url===url&&i.message===message))run.issues.push({severity,code,message:String(message).slice(0,1500),url,step});};
  const context=await browser.newContext({ignoreHTTPSErrors:false,serviceWorkers:'block',acceptDownloads:false,viewport:{width:1440,height:1000},locale:'en-US',timezoneId:'America/New_York'});
@@ -40,14 +40,14 @@ export async function probe(browser,monitor,egress,artifactDir){
   context.on('request',r=>{requestStarts.set(r,Date.now());requestSteps.set(r,activeStep);if(topNavigation(r))navigationStarted.add(activeStep);if(r.isNavigationRequest()&&!r.redirectedFrom()){try{requestFroms.set(r,r.frame().page().url());}catch{}}add('request',r.method()+' '+r.url(),{url:r.url(),resource:r.resourceType(),step:activeStep});});
   context.on('response',r=>{const req=r.request();let mainNavigation=false;try{mainNavigation=req.isNavigationRequest()&&!req.frame().parentFrame();}catch{mainNavigation=req.isNavigationRequest();}
    const from=requestFroms.get(req);
-   if(mainNavigation&&requestSteps.get(req)==='Destination'&&from&&from!=='about:blank'&&from!==r.url()&&run.redirects.length<100)run.redirects.push({kind:'page_navigation',from,to:r.url(),status:r.status(),duration_ms:Math.max(0,Date.now()-(requestStarts.get(req)||Date.now())),at:Date.now()-start,step:'Destination'});
+   if(mainNavigation&&r.status()>=200&&r.status()<300&&from&&from!=='about:blank'&&from!==r.url()&&run.redirects.length<100)run.redirects.push({kind:'page_navigation',from,to:r.url(),status:r.status(),duration_ms:Math.max(0,Date.now()-(requestStarts.get(req)||Date.now())),at:Date.now()-start,step:requestSteps.get(req)||activeStep});
    if(mainNavigation&&r.status()>=300&&r.status()<400){
     const location=r.headers()['location'];if(location&&run.redirects.length<100)try{run.redirects.push({from:r.url(),to:new URL(location,r.url()).href,status:r.status(),duration_ms:Math.max(0,Date.now()-(requestStarts.get(req)||Date.now())),at:Date.now()-start,step:requestSteps.get(req)||activeStep});}catch{}
    }
    add('response',String(r.status()),{url:r.url(),status:r.status(),resource:req.resourceType(),step:activeStep});if(r.status()>=400)issue(mainNavigation?'error':'warning','http_'+r.status(),'HTTP '+r.status(),r.url(),activeStep);});
  const attach=p=>{
   p.on('console',m=>{if(['error','warning'].includes(m.type())){add('console',m.text(),{level:m.type(),url:p.url(),step:activeStep});issue('warning','console_'+m.type(),m.text(),p.url(),activeStep);}});
-  p.on('pageerror',e=>{add('javascript',e.message,{url:p.url(),step:activeStep});issue('warning','javascript_error',e.message,p.url(),activeStep);});
+  p.on('pageerror',e=>{add('javascript',e.message,{url:p.url(),step:activeStep,stack:e.stack?.slice(0,6000)});issue('warning','javascript_error',e.message,p.url(),activeStep);});
   p.on('framenavigated',f=>{if(f===p.mainFrame())add('navigation',f.url(),{url:f.url(),step:activeStep});});
   p.on('dialog',d=>{issue('review','dialog','Page opened a '+d.type()+' dialog: '+d.message(),p.url(),activeStep);void d.dismiss();});
   p.on('download',d=>{issue('review','download','Download requires manual review: '+d.suggestedFilename(),p.url(),activeStep);void d.cancel();});
@@ -144,7 +144,7 @@ export async function probe(browser,monitor,egress,artifactDir){
   if(!run.destinationMatched)issue('error','destination_mismatch','Final URL does not contain the expected text: '+monitor.expected,run.final_url,activeStep);
   add('destination',run.destinationMatched?'Destination matched':'Destination mismatch',{url:run.final_url,elapsed_ms:run.elapsed_ms});await screenshot(page,'Destination');
   if(run.destinationMatched){
-   const root=run.final_url,visited=new Set();
+   let root=run.final_url;const visited=new Set();
    const replay=async path=>{
     activeStep='Returning to branch';
     for(const other of context.pages())if(other!==page)await other.close().catch(()=>{});
@@ -214,6 +214,31 @@ export async function probe(browser,monitor,egress,artifactDir){
     }
    };
    await walk([]);
+   // Preserve the original HTTP journey. A secure comparison is a separate,
+   // explicitly labelled diagnostic visit, never represented as a button redirect.
+   const inertHttp=root.startsWith('http:')&&run.steps.length>0&&run.steps.every(s=>!s.navigationAttempted&&!s.newDocument&&s.clickEvidence?.some(e=>e.trusted&&e.matchedControl));
+   const startupError=run.issues.some(i=>i.code==='javascript_error'&&i.step==='Destination');
+   if(inertHttp&&startupError&&run.coverage.attempted<maxClicks&&Date.now()-start<140000){
+    const secure=new URL(root);secure.protocol='https:';
+    const original=root,diagnostic={index:run.steps.length+1,parentStep:0,path:['HTTPS comparison'],label:'HTTPS comparison',kind:'https_comparison',from:root,to:'',status:'review',duration_ms:0,depth:0,expectedNavigation:true,newDocument:true,navigationAttempted:false};
+    run.steps.push(diagnostic);activeStep='HTTPS comparison';const began=Date.now();
+    add('diagnostic_navigation','Testing the same lander over HTTPS; this is not a button redirect',{url:secure.href,from:original,step:activeStep});
+    issue('warning','inert_http_lander','Real clicks reached the HTTP controls but no navigation began. A separate HTTPS comparison follows; the original observations remain unchanged.',original,activeStep);
+    try{
+     page=await context.newPage();await page.goto(secure.href,{waitUntil:'domcontentloaded',timeout});await settle(page);
+     diagnostic.to=page.url();diagnostic.navigationAttempted=navigationStarted.has(activeStep);diagnostic.metrics=await inspect(page);
+     await screenshot(page,'HTTPS comparison lander');
+     if(page.url().startsWith('https:')&&destinationMatches(page.url(),monitor.expected)){
+      root=page.url();run.httpsComparison={attempted:true,source:secure.href,final_url:root,parentStep:diagnostic.index};
+      await walk([],diagnostic.index);
+     }else{
+      run.httpsComparison={attempted:true,source:secure.href,final_url:page.url(),parentStep:diagnostic.index,notFollowed:true};
+      stop('https_comparison_unavailable',page,0,diagnostic.index,'HTTPS comparison did not remain secure or did not match the expected destination; its controls were not exercised.');
+     }
+    }catch(e){diagnostic.to=page?.url()||'';diagnostic.status='warning';issue('warning','https_comparison_failed',e.message,secure.href,activeStep);}
+    diagnostic.duration_ms=Date.now()-began;
+    add('https_comparison','Separate secure comparison completed',diagnostic);
+   }
   }else {add('skipped','Click-through skipped because destination did not match');stop('destination_mismatch',page,0,0,'Click-through was skipped because the destination did not match.');}
  }catch(e){if(aborted){run.coverage.truncated=true;if(page)stop('time_limit',page,run.coverage.depthReached,run.steps.length,'Journey exceeded its 180-second time budget.');}issue('error',aborted?'journey_timeout':/Timeout/.test(e.name)?'navigation_timeout':'navigation_error',aborted?'Journey exceeded the 180-second total budget':e.message,page?.url()||monitor.source,activeStep);if(page)await screenshot(page,'Failure');}
  finally{clearTimeout(deadline);await context.close().catch(()=>{});}
