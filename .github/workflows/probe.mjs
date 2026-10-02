@@ -1,8 +1,8 @@
-import {randomUUID} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import {destinationMatches,classifyControl} from './safety.mjs';
 export async function probe(browser,monitor,egress,artifactDir){
  const start=Date.now(),options=monitor.options||{},timeout=options.timeoutMs||30000,maxClicks=options.maxClicks||8,maxDepth=options.maxDepth||2;
- const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],coverage:{attempted:0,passed:0,failed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth},ruleVersion:1};
+ const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],coverage:{attempted:0,passed:0,failed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:2};
  const add=(type,message,extra={})=>{if(run.events.length<4000)run.events.push({at:Date.now()-start,type,message:String(message).slice(0,3000),...extra});else run.coverage.truncated=true;};
  const issue=(severity,code,message,url,step)=>{if(run.issues.length<200&&!run.issues.some(i=>i.code===code&&i.url===url&&i.message===message))run.issues.push({severity,code,message:String(message).slice(0,1500),url,step});};
  const context=await browser.newContext({ignoreHTTPSErrors:false,serviceWorkers:'block',acceptDownloads:false,viewport:{width:1440,height:1000},locale:'en-US',timezoneId:'America/New_York'});
@@ -39,7 +39,34 @@ export async function probe(browser,monitor,egress,artifactDir){
   if(p.url().startsWith('http:'))issue('warning','insecure_http','Destination uses unencrypted HTTP',p.url(),activeStep);
   return d.metrics;
  };
- const controls=async p=>p.locator('a,button,[role="button"],input[type="submit"],input[type="button"]').evaluateAll(els=>els.map((e,index)=>({index,label:(e.innerText||e.getAttribute('aria-label')||e.getAttribute('value')||e.getAttribute('title')||'Unlabelled control').trim().slice(0,140),href:e.href||'',type:e.type||'',form:!!e.closest('form'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true',visible:!!(e.getBoundingClientRect().width&&e.getBoundingClientRect().height)&&getComputedStyle(e).visibility!=='hidden'})).filter(c=>c.visible));
+ // Explicit click semantics plus pointer-styled custom controls. Never fill inputs.
+ const selector='a,button,[role="button"],[role="link"],input[type="submit"],input[type="button"],[onclick],[ng-click],[data-ng-click],[tabindex="0"],div,span';
+ const controls=async p=>p.locator(selector).evaluateAll(els=>{
+  const candidates=els.map((e,index)=>{
+   const explicit=e.matches('a,button,[role="button"],[role="link"],input[type="submit"],input[type="button"],[onclick],[ng-click],[data-ng-click]');
+   const style=getComputedStyle(e),rect=e.getBoundingClientRect(),label=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('value')||e.getAttribute('title')||'Unlabelled control').trim().slice(0,140);
+   const eligible=explicit||style.cursor==='pointer'&&label!=='Unlabelled control'&&(e.innerText||'').length<=140;
+   return {element:e,index,label,href:e.href||'',tag:e.tagName,type:e.type||'',form:!!e.closest('form'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true',visible:!!(rect.width&&rect.height)&&style.visibility!=='hidden'&&style.display!=='none',eligible,explicit};
+  }).filter(c=>c.visible&&c.eligible&&!c.element.matches('select,textarea,input:not([type="button"]):not([type="submit"])'));
+  // Ignore decorative descendants of semantic controls, and pointer-style wrappers.
+  return candidates.filter(c=>!candidates.some(other=>other!==c&&((other.explicit&&other.element.contains(c.element))||(!c.explicit&&c.element.contains(other.element))))).map(({element,visible,eligible,explicit,...c})=>c);
+ });
+ const resolve=async(p,c)=>{
+  const matches=(await controls(p)).filter(x=>x.label===c.label&&x.href===c.href&&x.tag===c.tag&&x.type===c.type);
+  if(matches.length!==1)throw new Error(matches.length?'Control is ambiguous after the page changed':'Control is no longer available');
+  if(classifyControl(matches[0])!=='navigation')throw new Error('Control is no longer eligible for navigation');
+  return p.locator(selector).nth(matches[0].index);
+ };
+ const state=async p=>({url:p.url(),text:await p.locator('body').innerText(),scroll:await p.evaluate(()=>scrollY)});
+ const key=d=>createHash('sha256').update(d.url+'|'+d.text).digest('hex');
+ const stop=(reason,p,depth,step,message)=>{if(run.coverage.stopReasons.length<50)run.coverage.stopReasons.push({reason,url:p.url(),depth,step,message});add('journey_stop',message,{reason,url:p.url(),depth,step});};
+ const click=async(p,c)=>{
+  const target=await resolve(p,c),oldPages=new Set(context.pages());
+  await target.click({timeout:Math.min(timeout,8000)});
+  await new Promise(r=>setTimeout(r,700));
+  const next=context.pages().find(x=>!oldPages.has(x)&&!x.isClosed())||p;
+  await settle(next);return next;
+ };
  const screenshot=async(p,name)=>{try{const filename=run.id+'-'+run.artifacts.length+'.png';await p.screenshot({path:artifactDir+'/'+filename,fullPage:false,timeout:5000});run.artifacts.push({filename,label:name});}catch(e){add('artifact_error',e.message);}};
  try{
   page=await context.newPage();add('start','Loading source URL',{url:monitor.source});
@@ -48,33 +75,59 @@ export async function probe(browser,monitor,egress,artifactDir){
   if(!run.destinationMatched)issue('error','destination_mismatch','Final URL does not contain the expected text: '+monitor.expected,run.final_url,activeStep);
   add('destination',run.destinationMatched?'Destination matched':'Destination mismatch',{url:run.final_url,elapsed_ms:run.elapsed_ms});await screenshot(page,'Destination');
   if(run.destinationMatched){
-   const root=run.final_url,queue=[{path:[],depth:0,url:root}],visited=new Set();
-   while(queue.length&&run.coverage.attempted<maxClicks){
-    const node=queue.shift();if(visited.has(node.url+'|'+node.path.map(p=>p.label).join('>')))continue;visited.add(node.url+'|'+node.path.map(p=>p.label).join('>'));
-    if(node.path.length){await page.goto(root,{waitUntil:'domcontentloaded',timeout});await settle(page);for(const prior of node.path){const c=page.locator('a,button,[role="button"],input[type="submit"],input[type="button"]').nth(prior.index);const current=(await c.innerText().catch(()=>''))||await c.getAttribute('aria-label')||await c.getAttribute('value')||'Unlabelled control';if(current.trim().slice(0,140)!==prior.label)throw new Error('Page controls changed during journey replay');const oldPages=new Set(context.pages());await c.click({timeout:7000});await page.waitForTimeout(400);page=context.pages().find(p=>!oldPages.has(p))||page;await settle(page);}}
+   const root=run.final_url,visited=new Set();
+   const replay=async path=>{
+    activeStep='Returning to branch';
+    for(const other of context.pages())if(other!==page)await other.close().catch(()=>{});
+    if(page.isClosed())page=await context.newPage();
+    await page.goto(root,{waitUntil:'domcontentloaded',timeout});await settle(page);
+    for(const prior of path)page=await click(page,prior);
+   };
+   const walk=async(path,parentStep=0)=>{
+    const depth=path.length,current=await state(page),signature=key(current);
+    if(visited.has(signature)){stop('already_visited',page,depth,parentStep,'This page state was already checked; repeated paths were not explored again.');return;}
+    visited.add(signature);run.coverage.pagesVisited++;run.coverage.depthReached=Math.max(run.coverage.depthReached,depth);
     const found=await controls(page);run.coverage.discovered+=found.length;
-    if(!found.length)issue('warning','dead_end','No visible buttons or links were found at this step',page.url(),activeStep);
+    const eligible=[];
     for(const c of found){
-     if(run.coverage.attempted>=maxClicks){run.coverage.truncated=true;break;}
-     const classification=classifyControl(c);if(classification!=='navigation'){run.coverage.skipped++;add('skipped',c.label,{reason:classification,url:page.url(),step:activeStep});if(classification==='disabled')issue('review','disabled_control','Disabled control: '+c.label,page.url(),activeStep);else issue('review','manual_step',c.label+' requires manual review ('+classification+')',page.url(),activeStep);continue;}
-     // Return to the same parent for every branch, then revalidate the control identity.
-     if(run.coverage.attempted>0){await page.goto(root,{waitUntil:'domcontentloaded',timeout});await settle(page);for(const prior of node.path){const oldPages=new Set(context.pages());const replay=page.locator('a,button,[role="button"],input[type="submit"],input[type="button"]').nth(prior.index);const attrs=await replay.evaluate(e=>({label:(e.innerText||e.getAttribute('aria-label')||e.getAttribute('value')||e.getAttribute('title')||'Unlabelled control').trim().slice(0,140),href:e.href||''}));if(attrs.label!==prior.label||attrs.href!==prior.href)throw new Error('Page controls changed during replay');await replay.click({timeout:7000});await page.waitForTimeout(400);page=context.pages().find(p=>!oldPages.has(p))||page;await settle(page);}}
-     const step={index:run.steps.length+1,label:c.label,from:page.url(),to:'',status:'passed',duration_ms:0,depth:node.depth+1};activeStep='Click '+step.index+': '+c.label;const began=Date.now(),beforeUrl=page.url(),beforeText=await page.locator('body').innerText(),beforeScroll=await page.evaluate(()=>scrollY),priorIssues=run.issues.length;
-     run.coverage.attempted++;try{
-      const target=page.locator('a,button,[role="button"],input[type="submit"],input[type="button"]').nth(c.index);const attrs=await target.evaluate(e=>({label:(e.innerText||e.getAttribute('aria-label')||e.getAttribute('value')||e.getAttribute('title')||'Unlabelled control').trim().slice(0,140),href:e.href||''}));if(attrs.label!==c.label||attrs.href!==c.href)throw new Error('Control changed before clicking');
-      const oldPages=new Set(context.pages());await target.click({timeout:Math.min(timeout,8000)});await page.waitForTimeout(700);page=context.pages().find(p=>!oldPages.has(p))||page;await settle(page);step.to=page.url();step.metrics=await inspect(page);
-      const afterText=await page.locator('body').innerText(),afterScroll=await page.evaluate(()=>scrollY);if(beforeUrl===step.to&&beforeText===afterText&&Math.abs(afterScroll-beforeScroll)<20){step.status='warning';issue('warning','no_visible_effect','Click produced no observable navigation, content, or scroll change: '+c.label,step.from,activeStep);}
-      const next=await controls(page);if(!next.length){step.status='warning';issue('warning','possible_dead_end','No further visible navigation after '+c.label,step.to,activeStep);}
-      if(node.depth+1<maxDepth&&next.some(x=>classifyControl(x)==='navigation'))queue.push({path:[...node.path,c],url:step.to,depth:node.depth+1});else if(node.depth+1>=maxDepth&&next.length)run.coverage.truncated=true;
-      if(run.issues.slice(priorIssues).some(i=>i.severity==='error'))step.status='failed';
-     }catch(e){step.status='failed';step.to=page.url();issue('error','click_failed',c.label+': '+e.message,step.from,activeStep);}
-     step.duration_ms=Date.now()-began;run.steps.push(step);add('click',c.label,step);if(step.status==='passed')run.coverage.passed++;else{run.coverage.failed++;await screenshot(page,'Problem: '+c.label);}
-     for(const other of context.pages())if(other!==page)await other.close().catch(()=>{});
+     const classification=classifyControl(c);
+     if(classification==='navigation'){eligible.push(c);continue;}
+     run.coverage.skipped++;add('skipped',c.label,{reason:classification,url:page.url(),step:parentStep});
+     issue('review',classification==='disabled'?'disabled_control':'manual_step',c.label+' requires manual review ('+classification+')',page.url(),activeStep);
     }
-   }
-   if(queue.length)run.coverage.truncated=true;
-  }else add('skipped','Click-through skipped because destination did not match');
- }catch(e){issue('error',aborted?'journey_timeout':/Timeout/.test(e.name)?'navigation_timeout':'navigation_error',aborted?'Journey exceeded the 180-second total budget':e.message,page?.url()||monitor.source,activeStep);if(page)await screenshot(page,'Failure');}
+    if(!eligible.length){
+     const reason=found.length?'manual_review':'no_controls';
+     stop(reason,page,depth,parentStep,found.length?'All visible controls need manual review; no eligible navigation remains.':'No visible navigation controls were found. This may be an endpoint or a blocked journey.');
+     issue(found.length?'review':'warning',found.length?'manual_endpoint':'possible_dead_end',found.length?'Journey stopped at controls requiring manual review':'No further visible navigation was found',page.url(),activeStep);return;
+    }
+    if(depth>=maxDepth){run.coverage.truncated=true;stop('depth_limit',page,depth,parentStep,'Configured depth reached; further controls remain unchecked.');return;}
+    // Follow likely forward navigation first, then explore sibling branches.
+    const priority=c=>/^(next|continue|start|get started|learn more|view|explore)\b/i.test(c.label)?0:/privacy|terms|cookie|contact|back|home/i.test(c.label+' '+c.href)?2:1;
+    eligible.sort((a,b)=>priority(a)-priority(b));
+    for(let i=0;i<eligible.length;i++){
+     if(run.coverage.attempted>=maxClicks){run.coverage.truncated=true;stop('click_limit',page,depth,parentStep,'Configured click budget reached; further controls remain unchecked.');return;}
+     if(i>0){try{await replay(path);}catch(e){stop('replay_failed',page,depth,parentStep,'Could not return to this branch: '+e.message);issue('review','replay_failed','Branch could not be restored: '+e.message,page.url(),'Returning to branch');return;}}
+     const c=eligible[i],step={index:run.steps.length+1,parentStep,path:[...path.map(c=>c.label),c.label],label:c.label,from:page.url(),to:'',status:'passed',duration_ms:0,depth:depth+1};
+     activeStep='Click '+step.index+': '+c.label;const began=Date.now(),before=await state(page),priorIssues=run.issues.length;let changed=false;
+     run.coverage.attempted++;run.steps.push(step);
+     try{
+      page=await click(page,c);step.to=page.url();step.metrics=await inspect(page);
+      const after=await state(page);changed=before.url!==after.url||before.text!==after.text;
+      if(!changed&&Math.abs(after.scroll-before.scroll)<20){step.status='warning';issue('warning','no_visible_effect','Click produced no observable navigation, content, or scroll change: '+c.label,step.from,activeStep);stop('no_visible_effect',page,depth+1,step.index,'Click had no visible effect; this branch was not followed further.');}
+      else if(!changed)stop('scroll_only',page,depth+1,step.index,'Click scrolled the page without opening a new page state.');
+      if(run.issues.slice(priorIssues).some(i=>i.severity==='error'))step.status='failed';
+      else if(run.issues.slice(priorIssues).some(i=>i.severity==='warning'))step.status='warning';
+     }catch(e){step.status='failed';step.to=page.url();issue('error','click_failed',c.label+': '+e.message,step.from,activeStep);stop('click_failed',page,depth+1,step.index,'Control could not be clicked: '+e.message);}
+     step.duration_ms=Date.now()-began;add('click',c.label,step);
+     if(step.status==='passed')run.coverage.passed++;else run.coverage.failed++;
+     run.coverage.depthReached=Math.max(run.coverage.depthReached,step.depth);
+     await screenshot(page,'Step '+step.index+' · Depth '+step.depth+' · '+c.label);
+     if(changed&&step.status!=='failed')await walk([...path,c],step.index);
+    }
+   };
+   await walk([]);
+  }else {add('skipped','Click-through skipped because destination did not match');stop('destination_mismatch',page,0,0,'Click-through was skipped because the destination did not match.');}
+ }catch(e){if(aborted){run.coverage.truncated=true;if(page)stop('time_limit',page,run.coverage.depthReached,run.steps.length,'Journey exceeded its 180-second time budget.');}issue('error',aborted?'journey_timeout':/Timeout/.test(e.name)?'navigation_timeout':'navigation_error',aborted?'Journey exceeded the 180-second total budget':e.message,page?.url()||monitor.source,activeStep);if(page)await screenshot(page,'Failure');}
  finally{clearTimeout(deadline);await context.close().catch(()=>{});}
  if(run.coverage.truncated)issue('review','coverage_limit','Check reached a click, depth, time, or log limit; unvisited paths remain',run.final_url,activeStep);
  if(!run.elapsed_ms)run.elapsed_ms=Date.now()-start;
