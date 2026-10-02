@@ -2,7 +2,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {destinationMatches,classifyControl,canNavigate,consequential} from './safety.mjs';
 export async function probe(browser,monitor,egress,artifactDir){
  const start=Date.now(),options=monitor.options||{},timeout=options.timeoutMs||30000,maxClicks=options.maxClicks||8,maxDepth=options.maxDepth||2;
- const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],redirects:[],coverage:{attempted:0,passed:0,failed:0,warnings:0,reviewed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:4};
+ const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],redirects:[],coverage:{attempted:0,passed:0,failed:0,warnings:0,reviewed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:5};
  const add=(type,message,extra={})=>{if(run.events.length<4000)run.events.push({at:Date.now()-start,type,message:String(message).slice(0,3000),...extra});else run.coverage.truncated=true;};
  const issue=(severity,code,message,url,step)=>{if(run.issues.length<200&&!run.issues.some(i=>i.code===code&&i.url===url&&i.message===message))run.issues.push({severity,code,message:String(message).slice(0,1500),url,step});};
  const context=await browser.newContext({ignoreHTTPSErrors:false,serviceWorkers:'block',acceptDownloads:false,viewport:{width:1440,height:1000},locale:'en-US',timezoneId:'America/New_York'});
@@ -61,19 +61,27 @@ export async function probe(browser,monitor,egress,artifactDir){
   return d.metrics;
  };
  // Explicit click semantics plus pointer-styled custom controls. Never fill inputs.
- const selector='a,button,[role="button"],[role="link"],input[type="submit"],input[type="button"],[onclick],[ng-click],[data-ng-click],[tabindex="0"],div,span';
+ // Custom CTA elements can use any tag and inherit cursor:pointer from a card.
+ const selector='*';
  const controls=async p=>p.locator(selector).evaluateAll(els=>{
   const candidates=els.map((e,index)=>{
    const explicit=e.matches('a,button,[role="button"],[role="link"],input[type="submit"],input[type="button"],[onclick],[ng-click],[data-ng-click]');
-   const style=getComputedStyle(e),rect=e.getBoundingClientRect(),label=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('value')||e.getAttribute('title')||'Unlabelled control').trim().slice(0,140);
+   const style=getComputedStyle(e),rect=e.getBoundingClientRect(),label=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('value')||e.getAttribute('title')||'Unlabelled control').trim().replace(/\s+/g,' ').slice(0,140);
+   const actionLabel=label.length<=80&&label.split(' ').length<=10&&/^(next|continue|start|get started|learn more|view|show|read|open|see|explore)\b/i.test(label);
+   const buttonStyle=/(^|[\s_-])(btn|button|cta)([\s_-]|$)/i.test(e.getAttribute('class')||'');
    let container=e.parentElement,contextLabel='';for(let depth=0;container&&depth<4;depth++,container=container.parentElement){const text=(container.innerText||'').trim().replace(/\s+/g,' ');if(text&&text!==label&&text.length<=1000){contextLabel=text.slice(0,400);break;}}
    const identity=e.id||e.getAttribute('data-offer-id')||e.getAttribute('data-study-id')||e.getAttribute('data-id')||e.getAttribute('onclick')||'';
    const semantic=e.matches('a,button,input,[role=button],[role=link]');
-   const eligible=explicit||style.cursor==='pointer'&&(!e.parentElement||getComputedStyle(e.parentElement).cursor!=='pointer'||e.getAttribute('tabindex')==='0')&&label!=='Unlabelled control'&&(e.innerText||'').length<=140;
-   return {element:e,index,label,identity,contextLabel,semantic,href:e.href||'',tag:e.tagName,type:e.type||'',form:!!(e.form||e.closest('form')),submits:!!e.form&&['submit','image'].includes(e.type),download:e.hasAttribute('download'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true',visible:!!(rect.width&&rect.height)&&style.visibility!=='hidden'&&style.display!=='none',eligible,explicit};
+   const eligible=explicit||actionLabel&&buttonStyle||style.cursor==='pointer'&&(!e.parentElement||getComputedStyle(e.parentElement).cursor!=='pointer'||e.getAttribute('tabindex')==='0'||actionLabel)&&label!=='Unlabelled control'&&(e.innerText||'').length<=140;
+   return {element:e,index,label,identity,contextLabel,semantic,actionLabel,href:e.href||'',tag:e.tagName,type:e.type||'',form:!!(e.form||e.closest('form')),submits:!!e.form&&['submit','image'].includes(e.type),download:e.hasAttribute('download'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true',visible:!!(rect.width&&rect.height)&&style.visibility!=='hidden'&&style.display!=='none',eligible,explicit};
   }).filter(c=>c.visible&&c.eligible&&!c.element.matches('select,textarea,input:not([type="button"]):not([type="submit"])'));
-  // Ignore decorative descendants of semantic controls, and pointer-style wrappers.
-  const found=candidates.filter(c=>!candidates.some(other=>other!==c&&((other.semantic&&other.element.contains(c.element))||(!c.semantic&&c.element.contains(other.element))))).map(({element,visible,eligible,explicit,semantic,...c})=>c);
+  // Click the dedicated CTA inside a card, not the card's geometric center.
+  // Keep decorative spans inside real buttons/links as part of that one control.
+  const dedicatedChild=(parent,child)=>!['BUTTON','INPUT'].includes(parent.tag)&&!parent.actionLabel&&child.actionLabel;
+  const found=candidates.filter(c=>!candidates.some(other=>other!==c&&(
+   other.semantic&&other.element.contains(c.element)&&!dedicatedChild(other,c)||
+   c.element.contains(other.element)&&(!c.semantic||dedicatedChild(c,other))
+  ))).map(({element,visible,eligible,explicit,semantic,actionLabel,...c})=>c);
   return found.map(c=>{const peers=found.filter(x=>x.label===c.label&&x.href===c.href&&x.tag===c.tag&&x.type===c.type&&x.identity===c.identity&&x.contextLabel===c.contextLabel);return {...c,occurrence:peers.indexOf(c),duplicates:peers.length};});
  });
  const resolve=async(p,c)=>{
@@ -114,6 +122,7 @@ export async function probe(browser,monitor,egress,artifactDir){
     if(visited.has(signature)){stop('already_visited',page,depth,parentStep,'This page state was already checked; repeated paths were not explored again.');return;}
     visited.add(signature);run.coverage.pagesVisited++;run.coverage.depthReached=Math.max(run.coverage.depthReached,depth);
     const found=await controls(page);run.coverage.discovered+=found.length;
+    add('controls',`${found.length} controls discovered`,{url:page.url(),step:parentStep,controls:found.slice(0,80).map(c=>({label:c.label,tag:c.tag,context:c.contextLabel,classification:classifyControl(c)}))});
     const eligible=[];
     for(const c of found){
      const classification=classifyControl(c);
@@ -165,7 +174,7 @@ export async function probe(browser,monitor,egress,artifactDir){
      step.duration_ms=Date.now()-began;add('click',c.label,step);
      if(step.status==='passed')run.coverage.passed++;else if(step.status==='failed')run.coverage.failed++;else if(step.status==='warning')run.coverage.warnings++;else run.coverage.reviewed++;
      run.coverage.depthReached=Math.max(run.coverage.depthReached,step.depth);
-     if(step.navigationAttempted||step.newDocument||step.from.split('#')[0]!==step.to.split('#')[0])await screenshot(page,(step.failureKind==='redirect'?'Failed redirect':'Lander')+' after step '+step.index+' · '+c.label);
+     if(step.navigationAttempted||step.newDocument||step.from.split('#')[0]!==step.to.split('#')[0])await screenshot(page,(step.failureKind==='redirect'?'Failed redirect':'Lander')+' after step '+step.index+' Â· '+c.label);
      if(changed&&step.status!=='failed')await walk([...path,c],step.index);
     }
    };
