@@ -1,0 +1,43 @@
+name: Journey checks
+
+on:
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: journey-checker
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 12
+
+    defaults:
+      run:
+        working-directory: .github/workflows
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install checker
+        run: npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Install browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Run checks
+        env:
+          MONITOR_SITE_URL: ${{ secrets.MONITOR_SITE_URL }}
+          MONITOR_JOB_TOKEN: ${{ secrets.MONITOR_JOB_TOKEN }}
+        run: node batch.mjs
