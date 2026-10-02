@@ -1,23 +1,35 @@
 import {createHash,randomUUID} from 'node:crypto';
-import {destinationMatches,classifyControl} from './safety.mjs';
+import {destinationMatches,classifyControl,canNavigate} from './safety.mjs';
 export async function probe(browser,monitor,egress,artifactDir){
  const start=Date.now(),options=monitor.options||{},timeout=options.timeoutMs||30000,maxClicks=options.maxClicks||8,maxDepth=options.maxDepth||2;
- const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],coverage:{attempted:0,passed:0,failed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:2};
+ const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],redirects:[],coverage:{attempted:0,passed:0,failed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:3};
  const add=(type,message,extra={})=>{if(run.events.length<4000)run.events.push({at:Date.now()-start,type,message:String(message).slice(0,3000),...extra});else run.coverage.truncated=true;};
  const issue=(severity,code,message,url,step)=>{if(run.issues.length<200&&!run.issues.some(i=>i.code===code&&i.url===url&&i.message===message))run.issues.push({severity,code,message:String(message).slice(0,1500),url,step});};
  const context=await browser.newContext({ignoreHTTPSErrors:false,serviceWorkers:'block',acceptDownloads:false,viewport:{width:1440,height:1000},locale:'en-US',timezoneId:'America/New_York'});
  let activeStep='Destination',page,aborted=false;const deadline=setTimeout(()=>{aborted=true;void context.close();},180000);
  await context.addInitScript(()=>{
+  window.__journeyBlockedForms=[];
+  const record=form=>window.__journeyBlockedForms.push({action:form.action||location.href,at:Date.now()});
+  document.addEventListener('submit',event=>{event.preventDefault();record(event.target);},true);
+  HTMLFormElement.prototype.submit=function(){record(this);};
+  // requestSubmit still dispatches validation and submit handlers; the capture guard cancels navigation.
   window.__journeyVitals={lcp:null,cls:0};try{new PerformanceObserver(l=>{for(const e of l.getEntries())window.__journeyVitals.lcp=e.startTime;}).observe({type:'largest-contentful-paint',buffered:true});new PerformanceObserver(l=>{for(const e of l.getEntries())if(!e.hadRecentInput)window.__journeyVitals.cls+=e.value;}).observe({type:'layout-shift',buffered:true});}catch{}
  });
  await context.route('**/*',async route=>{const r=route.request();if(!['GET','HEAD','OPTIONS'].includes(r.method())){add('skipped',`${r.method()} request blocked`,{url:r.url(),step:activeStep});issue('review','blocked_submission','A form or state-changing request needs manual review',r.url(),activeStep);return route.abort('blockedbyclient');}return route.continue();});
  await context.routeWebSocket('**/*',ws=>{add('skipped','WebSocket connection not exercised',{url:ws.url(),step:activeStep});issue('review','websocket','Real-time WebSocket behavior needs manual review',ws.url(),activeStep);ws.close();});
+ const requestStarts=new WeakMap(),requestSteps=new WeakMap(),requestFroms=new WeakMap();
  const attach=p=>{
   p.on('console',m=>{if(['error','warning'].includes(m.type())){add('console',m.text(),{level:m.type(),url:p.url(),step:activeStep});issue('warning','console_'+m.type(),m.text(),p.url(),activeStep);}});
   p.on('pageerror',e=>{add('javascript',e.message,{url:p.url(),step:activeStep});issue('warning','javascript_error',e.message,p.url(),activeStep);});
   p.on('requestfailed',r=>{const msg=r.failure()?.errorText||'Network request failed';add('network_error',msg,{url:r.url(),resource:r.resourceType(),step:activeStep});if(!/ERR_ABORTED|BLOCKED_BY_CLIENT/.test(msg))issue(r.isNavigationRequest()?'error':'warning','network_error',msg,r.url(),activeStep);});
-  p.on('request',r=>{add('request',r.method()+' '+r.url(),{url:r.url(),resource:r.resourceType(),step:activeStep});});
-  p.on('response',r=>{const req=r.request();add('response',String(r.status()),{url:r.url(),status:r.status(),resource:req.resourceType(),step:activeStep});if(r.status()>=400)issue(req.isNavigationRequest()?'error':'warning','http_'+r.status(),'HTTP '+r.status(),r.url(),activeStep);});
+  p.on('request',r=>{requestStarts.set(r,Date.now());requestSteps.set(r,activeStep);if(r.isNavigationRequest()&&!r.redirectedFrom())requestFroms.set(r,p.url());add('request',r.method()+' '+r.url(),{url:r.url(),resource:r.resourceType(),step:activeStep});});
+  p.on('response',r=>{const req=r.request();
+   const from=requestFroms.get(req);
+   if(req.isNavigationRequest()&&req.frame()===p.mainFrame()&&requestSteps.get(req)==='Destination'&&from&&from!=='about:blank'&&from!==r.url()&&run.redirects.length<100)run.redirects.push({kind:'page_navigation',from,to:r.url(),status:r.status(),duration_ms:Math.max(0,Date.now()-(requestStarts.get(req)||Date.now())),at:Date.now()-start,step:'Destination'});
+   if(req.isNavigationRequest()&&req.frame()===p.mainFrame()&&r.status()>=300&&r.status()<400){
+    const location=r.headers()['location'];if(location&&run.redirects.length<100)try{run.redirects.push({from:r.url(),to:new URL(location,r.url()).href,status:r.status(),duration_ms:Math.max(0,Date.now()-(requestStarts.get(req)||Date.now())),at:Date.now()-start,step:requestSteps.get(req)||activeStep});}catch{}
+   }
+   add('response',String(r.status()),{url:r.url(),status:r.status(),resource:req.resourceType(),step:activeStep});if(r.status()>=400)issue(req.isNavigationRequest()?'error':'warning','http_'+r.status(),'HTTP '+r.status(),r.url(),activeStep);});
   p.on('framenavigated',f=>{if(f===p.mainFrame())add('navigation',f.url(),{url:f.url(),step:activeStep});});
   p.on('dialog',d=>{issue('review','dialog','Page opened a '+d.type()+' dialog: '+d.message(),p.url(),activeStep);void d.dismiss();});
   p.on('download',d=>{issue('review','download','Download requires manual review: '+d.suggestedFilename(),p.url(),activeStep);void d.cancel();});
@@ -46,7 +58,7 @@ export async function probe(browser,monitor,egress,artifactDir){
    const explicit=e.matches('a,button,[role="button"],[role="link"],input[type="submit"],input[type="button"],[onclick],[ng-click],[data-ng-click]');
    const style=getComputedStyle(e),rect=e.getBoundingClientRect(),label=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('value')||e.getAttribute('title')||'Unlabelled control').trim().slice(0,140);
    const eligible=explicit||style.cursor==='pointer'&&label!=='Unlabelled control'&&(e.innerText||'').length<=140;
-   return {element:e,index,label,href:e.href||'',tag:e.tagName,type:e.type||'',form:!!e.closest('form'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true',visible:!!(rect.width&&rect.height)&&style.visibility!=='hidden'&&style.display!=='none',eligible,explicit};
+   return {element:e,index,label,href:e.href||'',tag:e.tagName,type:e.type||'',form:!!(e.form||e.closest('form')),submits:!!e.form&&['submit','image'].includes(e.type),download:e.hasAttribute('download'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true',visible:!!(rect.width&&rect.height)&&style.visibility!=='hidden'&&style.display!=='none',eligible,explicit};
   }).filter(c=>c.visible&&c.eligible&&!c.element.matches('select,textarea,input:not([type="button"]):not([type="submit"])'));
   // Ignore decorative descendants of semantic controls, and pointer-style wrappers.
   return candidates.filter(c=>!candidates.some(other=>other!==c&&((other.explicit&&other.element.contains(c.element))||(!c.explicit&&c.element.contains(other.element))))).map(({element,visible,eligible,explicit,...c})=>c);
@@ -54,10 +66,10 @@ export async function probe(browser,monitor,egress,artifactDir){
  const resolve=async(p,c)=>{
   const matches=(await controls(p)).filter(x=>x.label===c.label&&x.href===c.href&&x.tag===c.tag&&x.type===c.type);
   if(matches.length!==1)throw new Error(matches.length?'Control is ambiguous after the page changed':'Control is no longer available');
-  if(classifyControl(matches[0])!=='navigation')throw new Error('Control is no longer eligible for navigation');
+  if(!canNavigate(matches[0]))throw new Error('Control is no longer eligible for navigation');
   return p.locator(selector).nth(matches[0].index);
  };
- const state=async p=>({url:p.url(),text:await p.locator('body').innerText(),scroll:await p.evaluate(()=>scrollY)});
+ const state=async p=>({url:p.url(),text:await p.locator('body').innerText(),scroll:await p.evaluate(()=>scrollY),timeOrigin:await p.evaluate(()=>performance.timeOrigin)});
  const key=d=>createHash('sha256').update(d.url+'|'+d.text).digest('hex');
  const stop=(reason,p,depth,step,message)=>{if(run.coverage.stopReasons.length<50)run.coverage.stopReasons.push({reason,url:p.url(),depth,step,message});add('journey_stop',message,{reason,url:p.url(),depth,step});};
  const click=async(p,c)=>{
@@ -91,8 +103,8 @@ export async function probe(browser,monitor,egress,artifactDir){
     const eligible=[];
     for(const c of found){
      const classification=classifyControl(c);
-     if(classification==='navigation'){eligible.push(c);continue;}
-     run.coverage.skipped++;add('skipped',c.label,{reason:classification,url:page.url(),step:parentStep});
+     if(canNavigate(c)){eligible.push(c);continue;}
+     run.coverage.skipped++;add('skipped',c.label,{reason:classification,control:{tag:c.tag,type:c.type,insideForm:c.form,submits:c.submits},url:page.url(),step:parentStep});
      issue('review',classification==='disabled'?'disabled_control':'manual_step',c.label+' requires manual review ('+classification+')',page.url(),activeStep);
     }
     if(!eligible.length){
@@ -112,8 +124,11 @@ export async function probe(browser,monitor,egress,artifactDir){
      run.coverage.attempted++;run.steps.push(step);
      try{
       page=await click(page,c);step.to=page.url();step.metrics=await inspect(page);
-      const after=await state(page);changed=before.url!==after.url||before.text!==after.text;
-      if(!changed&&Math.abs(after.scroll-before.scroll)<20){step.status='warning';issue('warning','no_visible_effect','Click produced no observable navigation, content, or scroll change: '+c.label,step.from,activeStep);stop('no_visible_effect',page,depth+1,step.index,'Click had no visible effect; this branch was not followed further.');}
+      const blockedForms=await page.evaluate(()=>window.__journeyBlockedForms?.splice(0)||[]);
+      if(blockedForms.length){step.status='review';issue('review','form_submission_blocked','This control attempted to submit a form. Its click handler was exercised, but submission was stopped.',step.to,activeStep);add('skipped','Form submission prevented',{reason:'form_submission',step:activeStep});}
+
+      const after=await state(page);step.newDocument=before.timeOrigin!==after.timeOrigin;changed=before.url!==after.url||before.text!==after.text;
+      if(!changed&&Math.abs(after.scroll-before.scroll)<20){if(!blockedForms.length)step.status='warning';issue(blockedForms.length?'review':'warning',blockedForms.length?'submission_required':'no_visible_effect','Click produced no observable navigation, content, or scroll change: '+c.label,step.from,activeStep);stop(blockedForms.length?'submission_required':'no_visible_effect',page,depth+1,step.index,blockedForms.length?'Continuing requires a form submission, which was prevented.':'Click had no visible effect; this branch was not followed further.');}
       else if(!changed)stop('scroll_only',page,depth+1,step.index,'Click scrolled the page without opening a new page state.');
       if(run.issues.slice(priorIssues).some(i=>i.severity==='error'))step.status='failed';
       else if(run.issues.slice(priorIssues).some(i=>i.severity==='warning'))step.status='warning';
