@@ -2,13 +2,22 @@ import {createHash,randomUUID} from 'node:crypto';
 import {destinationMatches,classifyControl,canNavigate,consequential} from './safety.mjs';
 export async function probe(browser,monitor,egress,artifactDir){
  const start=Date.now(),options=monitor.options||{},timeout=options.timeoutMs||30000,maxClicks=options.maxClicks||8,maxDepth=options.maxDepth||2;
- const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],redirects:[],coverage:{attempted:0,passed:0,failed:0,warnings:0,reviewed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:5};
+ const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],redirects:[],coverage:{attempted:0,passed:0,failed:0,warnings:0,reviewed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:6};
  const add=(type,message,extra={})=>{if(run.events.length<4000)run.events.push({at:Date.now()-start,type,message:String(message).slice(0,3000),...extra});else run.coverage.truncated=true;};
  const issue=(severity,code,message,url,step)=>{if(run.issues.length<200&&!run.issues.some(i=>i.code===code&&i.url===url&&i.message===message))run.issues.push({severity,code,message:String(message).slice(0,1500),url,step});};
  const context=await browser.newContext({ignoreHTTPSErrors:false,serviceWorkers:'block',acceptDownloads:false,viewport:{width:1440,height:1000},locale:'en-US',timezoneId:'America/New_York'});
  let activeStep='Destination',page,aborted=false;const deadline=setTimeout(()=>{aborted=true;void context.close();},180000);
  await context.addInitScript(({dangerous})=>{
   window.__journeyBlockedForms=[];
+  window.__journeyClicks=[];
+  document.addEventListener('click',event=>{
+   const target=event.target, path=event.composedPath();
+   const describe=e=>({tag:e.tagName,label:(e.getAttribute?.('aria-label')||e.innerText||'').trim().replace(/\s+/g,' ').slice(0,160),className:typeof e.className==='string'?e.className:'',eventAction:e.getAttribute?.('data-event-action')||''});
+   const entry={at:Date.now(),trusted:event.isTrusted,target:describe(target),path:path.filter(e=>e instanceof Element).slice(0,5).map(describe),matchedControl:path.some(e=>e instanceof Element&&e.getAttribute('data-journey-target')===window.__journeyActiveTarget)};
+   window.__journeyClicks.push(entry);
+   if(window.__journeyClicks.length>20)window.__journeyClicks.shift();
+   queueMicrotask(()=>{entry.defaultPrevented=event.defaultPrevented;});
+  },true);
   const record=form=>window.__journeyBlockedForms.push({action:form.action||location.href,at:Date.now()});
   const infoNavigation=(form,button)=>{
    if(!button||button.form!==form)return false;
@@ -78,10 +87,13 @@ export async function probe(browser,monitor,egress,artifactDir){
   // Click the dedicated CTA inside a card, not the card's geometric center.
   // Keep decorative spans inside real buttons/links as part of that one control.
   const dedicatedChild=(parent,child)=>!['BUTTON','INPUT'].includes(parent.tag)&&!parent.actionLabel&&child.actionLabel;
+  const markerPrefix='jm-'+Math.random().toString(36).slice(2)+'-';
   const found=candidates.filter(c=>!candidates.some(other=>other!==c&&(
    other.semantic&&other.element.contains(c.element)&&!dedicatedChild(other,c)||
    c.element.contains(other.element)&&(!c.semantic||dedicatedChild(c,other))
-  ))).map(({element,visible,eligible,explicit,semantic,actionLabel,...c})=>c);
+  ))).map(({element,visible,eligible,explicit,semantic,actionLabel,...c})=>{
+   const marker=markerPrefix+c.index;element.setAttribute('data-journey-target',marker);return {...c,marker};
+  });
   return found.map(c=>{const peers=found.filter(x=>x.label===c.label&&x.href===c.href&&x.tag===c.tag&&x.type===c.type&&x.identity===c.identity&&x.contextLabel===c.contextLabel);return {...c,occurrence:peers.indexOf(c),duplicates:peers.length};});
  });
  const resolve=async(p,c)=>{
@@ -89,17 +101,40 @@ export async function probe(browser,monitor,egress,artifactDir){
   if(matches.length>1&&matches.length===c.duplicates)matches=[matches[c.occurrence]];
   if(matches.length!==1)throw new Error(matches.length?'Control is ambiguous after the page changed':'Control is no longer available');
   if(!canNavigate(matches[0]))throw new Error('Control is no longer eligible for navigation');
-  return p.locator(selector).nth(matches[0].index);
+  return p.locator('[data-journey-target="'+matches[0].marker+'"]');
  };
  const state=async p=>({url:p.url(),text:await p.locator('body').innerText(),scroll:await p.evaluate(()=>scrollY),timeOrigin:await p.evaluate(()=>performance.timeOrigin)});
  const key=d=>createHash('sha256').update(d.url+'|'+d.text).digest('hex');
  const stop=(reason,p,depth,step,message)=>{if(run.coverage.stopReasons.length<50)run.coverage.stopReasons.push({reason,url:p.url(),depth,step,message});add('journey_stop',message,{reason,url:p.url(),depth,step});};
- const click=async(p,c)=>{
+ const click=async(p,c,expectedNavigation=false)=>{
   const target=await resolve(p,c),oldPages=new Set(context.pages());
+  // Scroll and pass actionability checks BEFORE measuring the click's effect.
+  await target.scrollIntoViewIfNeeded({timeout:Math.min(timeout,8000)});
+  await target.click({trial:true,timeout:Math.min(timeout,8000)});
+  await target.evaluate(e=>{window.__journeyActiveTarget=e.getAttribute('data-journey-target');window.__journeyClicks=[];});
+  const before=await state(p);
+  add('click_prepared',c.label,{step:activeStep,url:before.url,control:{tag:c.tag,label:c.label,context:c.contextLabel}});
+  const clickedAt=Date.now();
   await target.click({timeout:Math.min(timeout,8000)});
-  await new Promise(r=>setTimeout(r,700));
-  const next=context.pages().find(x=>!oldPages.has(x)&&!x.isClosed())||p;
-  await settle(next);return next;
+  // A popup may open after an async lookup. Observe throughout the window,
+  // instead of checking context.pages() just once 700 ms after clicking.
+  const observationMs=expectedNavigation?Math.min(timeout,10000):Math.min(timeout,2500);
+  let next=p;
+  while(Date.now()-clickedAt<observationMs){
+   const popup=context.pages().find(x=>!oldPages.has(x)&&!x.isClosed());
+   if(popup){next=popup;add('popup','Click opened a new tab',{step:activeStep,url:popup.url()});break;}
+   if(p.isClosed())throw new Error('Clicked page closed without a destination tab');
+   const now=await state(p).catch(()=>null);
+   if(now&&(now.timeOrigin!==before.timeOrigin||now.url!==before.url||(!expectedNavigation&&now.text!==before.text)))break;
+   await new Promise(r=>setTimeout(r,150));
+  }
+  await settle(next);
+  // Catch popups created while the opener was settling as well.
+  const latePopup=context.pages().find(x=>!oldPages.has(x)&&!x.isClosed());
+  if(latePopup&&latePopup!==next){next=latePopup;await settle(next);}
+  const dispatch=await p.evaluate(()=>window.__journeyClicks||[]).catch(()=>[]);
+  add('click_dispatch',dispatch.length?'Recorded browser click event':'Click event evidence unavailable after navigation',{step:activeStep,events:dispatch});
+  return {page:next,before,dispatch};
  };
  const screenshot=async(p,name)=>{try{const filename=run.id+'-'+run.artifacts.length+'.png';await p.screenshot({path:artifactDir+'/'+filename,fullPage:false,timeout:5000});run.artifacts.push({filename,label:name,url:p.url(),step:activeStep});}catch(e){add('artifact_error',e.message);}};
  try{
@@ -115,7 +150,7 @@ export async function probe(browser,monitor,egress,artifactDir){
     for(const other of context.pages())if(other!==page)await other.close().catch(()=>{});
     if(page.isClosed())page=await context.newPage();
     await page.goto(root,{waitUntil:'domcontentloaded',timeout});await settle(page);
-    for(const prior of path)page=await click(page,prior);
+    for(const prior of path)page=(await click(page,prior,true)).page;
    };
    const walk=async(path,parentStep=0)=>{
     const depth=path.length,current=await state(page),signature=key(current);
@@ -143,21 +178,21 @@ export async function probe(browser,monitor,egress,artifactDir){
      if(run.coverage.attempted>=maxClicks){run.coverage.truncated=true;stop('click_limit',page,depth,parentStep,'Configured click budget reached; further controls remain unchecked.');return;}
      if(i>0){try{await replay(path);}catch(e){stop('replay_failed',page,depth,parentStep,'Could not return to this branch: '+e.message);issue('review','replay_failed','Branch could not be restored: '+e.message,page.url(),'Returning to branch');return;}}
      const c=eligible[i],step={index:run.steps.length+1,parentStep,path:[...path.map(c=>c.label),c.label],label:c.label,from:page.url(),to:'',status:'passed',duration_ms:0,depth:depth+1};
-     activeStep='Click '+step.index+': '+c.label;const began=Date.now(),before=await state(page),priorIssues=run.issues.length;let changed=false;
+     activeStep='Click '+step.index+': '+c.label;const began=Date.now(),priorIssues=run.issues.length;let before=await state(page),changed=false;
      step.expectedNavigation=!!c.href&&/^https?:/i.test(c.href)&&c.href.split('#')[0]!==before.url.split('#')[0]||/^(next|continue|start|get started|learn more|view|show|read|open|see|explore)\b/i.test(c.label);
      run.coverage.attempted++;run.steps.push(step);
      try{
-      page=await click(page,c);step.to=page.url();step.metrics=await inspect(page);
+      const observed=await click(page,c,step.expectedNavigation);page=observed.page;before=observed.before;step.clickEvidence=observed.dispatch;step.to=page.url();step.metrics=await inspect(page);
       const blockedForms=await page.evaluate(()=>window.__journeyBlockedForms?.splice(0)||[]);
       if(blockedForms.length){step.status='review';issue('review','form_submission_blocked','This control attempted to submit a form. Its click handler was exercised, but submission was stopped.',step.to,activeStep);add('skipped','Form submission prevented',{reason:'form_submission',step:activeStep});}
 
       const after=await state(page);step.newDocument=before.timeOrigin!==after.timeOrigin;changed=before.url!==after.url||before.text!==after.text;
       step.navigationAttempted=navigationStarted.has(activeStep);
-      if(!changed&&Math.abs(after.scroll-before.scroll)<20){
+      if(!changed&&(step.expectedNavigation||blockedForms.length||Math.abs(after.scroll-before.scroll)<20)){
        if(blockedForms.length||step.expectedNavigation){step.status=blockedForms.length?'review':'warning';issue(blockedForms.length?'review':'warning',blockedForms.length?'submission_required':'no_visible_effect','No navigation was observed after '+c.label,step.from,activeStep);}
        else add('in_page','No redirect expected or observed: '+c.label,{step:activeStep,url:step.to});
        stop(blockedForms.length?'submission_required':step.expectedNavigation?'no_visible_effect':'in_page_only',page,depth+1,step.index,blockedForms.length?'Continuing requires a form submission, which was prevented.':step.expectedNavigation?'No navigation was observed; review this control.':'In-page interaction; no redirect was expected or observed.');
-      }else if(!changed)stop('scroll_only',page,depth+1,step.index,'Click scrolled the page without opening a new page state.');
+      }else if(!changed)stop('scroll_only',page,depth+1,step.index,'Scroll movement only; no destination navigation was observed.');
       const findings=run.issues.slice(priorIssues);
       const navigationError=findings.some(i=>i.severity==='error'&&(/^(http_|network_error)/.test(i.code)));
       const timedOut=findings.some(i=>i.code==='load_timeout');
@@ -174,7 +209,7 @@ export async function probe(browser,monitor,egress,artifactDir){
      step.duration_ms=Date.now()-began;add('click',c.label,step);
      if(step.status==='passed')run.coverage.passed++;else if(step.status==='failed')run.coverage.failed++;else if(step.status==='warning')run.coverage.warnings++;else run.coverage.reviewed++;
      run.coverage.depthReached=Math.max(run.coverage.depthReached,step.depth);
-     if(step.navigationAttempted||step.newDocument||step.from.split('#')[0]!==step.to.split('#')[0])await screenshot(page,(step.failureKind==='redirect'?'Failed redirect':'Lander')+' after step '+step.index+' Â· '+c.label);
+     if(step.navigationAttempted||step.newDocument||step.from.split('#')[0]!==step.to.split('#')[0])await screenshot(page,(step.failureKind==='redirect'?'Failed redirect':'Lander')+' after step '+step.index+' · '+c.label);
      if(changed&&step.status!=='failed')await walk([...path,c],step.index);
     }
    };
