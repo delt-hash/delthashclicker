@@ -44,7 +44,7 @@ try{
    let egress;try{egress=await verifyUS();}catch{regionFailures++;continue;}
    try{
     const run=await probe(browser,monitor,egress,dir),files=[];
-    // Retain destination and every attempted click, including successful pages.
+    // Retain destination, newly reached landers and failed redirects.
     for(const artifact of run.artifacts.slice(0,22)){
      try{const bytes=await readFile(join(dir,artifact.filename));if(bytes.length<=500000)files.push({...artifact,bytes});else run.events.push({type:'artifact_omitted',message:artifact.label+' exceeded the 500 KB screenshot limit.'});}catch{run.events.push({type:'artifact_omitted',message:artifact.label+' could not be read.'});}
     }
