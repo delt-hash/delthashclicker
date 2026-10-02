@@ -19,7 +19,7 @@ export function classifyControl(c){
  // Forward-labelled submit buttons can run their client-side click handlers;
  // the browser guard prevents native form submission and the route blocks writes.
  if(c.submits||c.form&&c.submits===undefined){
-  return /^(next|continue|start|get started|learn more)(?:\s*[→›»!]|\s+.*)?$/i.test(c.label||'')?'guarded_navigation':'form';
+  return /^(next|continue|start|get started|learn more|view|show|read|open|see|explore)(?:\s*[→›»!]|\s+.*)?$/i.test(c.label||'')?'guarded_navigation':'form';
  }
  return 'navigation';
 }
