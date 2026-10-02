@@ -1,35 +1,44 @@
 import {createHash,randomUUID} from 'node:crypto';
-import {destinationMatches,classifyControl,canNavigate} from './safety.mjs';
+import {destinationMatches,classifyControl,canNavigate,consequential} from './safety.mjs';
 export async function probe(browser,monitor,egress,artifactDir){
  const start=Date.now(),options=monitor.options||{},timeout=options.timeoutMs||30000,maxClicks=options.maxClicks||8,maxDepth=options.maxDepth||2;
- const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],redirects:[],coverage:{attempted:0,passed:0,failed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:3};
+ const run={id:randomUUID(),monitor_id:monitor.id,configVersion:monitor.updated_at,started_at:start,finished_at:null,status:'passed',source:monitor.source,expected:monitor.expected,final_url:'',destinationMatched:false,elapsed_ms:0,metrics:{},egress,issues:[],steps:[],events:[],artifacts:[],redirects:[],coverage:{attempted:0,passed:0,failed:0,warnings:0,reviewed:0,skipped:0,discovered:0,truncated:false,maxClicks,maxDepth,depthReached:0,pagesVisited:0,stopReasons:[]},ruleVersion:4};
  const add=(type,message,extra={})=>{if(run.events.length<4000)run.events.push({at:Date.now()-start,type,message:String(message).slice(0,3000),...extra});else run.coverage.truncated=true;};
  const issue=(severity,code,message,url,step)=>{if(run.issues.length<200&&!run.issues.some(i=>i.code===code&&i.url===url&&i.message===message))run.issues.push({severity,code,message:String(message).slice(0,1500),url,step});};
  const context=await browser.newContext({ignoreHTTPSErrors:false,serviceWorkers:'block',acceptDownloads:false,viewport:{width:1440,height:1000},locale:'en-US',timezoneId:'America/New_York'});
  let activeStep='Destination',page,aborted=false;const deadline=setTimeout(()=>{aborted=true;void context.close();},180000);
- await context.addInitScript(()=>{
+ await context.addInitScript(({dangerous})=>{
   window.__journeyBlockedForms=[];
   const record=form=>window.__journeyBlockedForms.push({action:form.action||location.href,at:Date.now()});
-  document.addEventListener('submit',event=>{event.preventDefault();record(event.target);},true);
-  HTMLFormElement.prototype.submit=function(){record(this);};
+  const infoNavigation=(form,button)=>{
+   if(!button||button.form!==form)return false;
+   const label=(button.getAttribute('aria-label')||button.innerText||button.value||'').trim();
+   const method=(button.getAttribute('formmethod')||form.method||'get').toLowerCase();
+   const action=button.getAttribute('formaction')||form.action||location.href;
+   return method==='get'&&/^(view|show|read|open|see|explore)\b/i.test(label)&&!new RegExp(dangerous,'i').test(label+' '+action)&&/^https?:/i.test(new URL(action,location.href).href)&&![...form.elements].some(e=>!e.disabled&&!['hidden','submit','button'].includes(e.type));
+  };
+  document.addEventListener('submit',event=>{if(infoNavigation(event.target,event.submitter))return;event.preventDefault();record(event.target);},true);
+  const nativeSubmit=HTMLFormElement.prototype.submit;
+  HTMLFormElement.prototype.submit=function(){if(infoNavigation(this,document.activeElement))return nativeSubmit.call(this);record(this);};
   // requestSubmit still dispatches validation and submit handlers; the capture guard cancels navigation.
   window.__journeyVitals={lcp:null,cls:0};try{new PerformanceObserver(l=>{for(const e of l.getEntries())window.__journeyVitals.lcp=e.startTime;}).observe({type:'largest-contentful-paint',buffered:true});new PerformanceObserver(l=>{for(const e of l.getEntries())if(!e.hadRecentInput)window.__journeyVitals.cls+=e.value;}).observe({type:'layout-shift',buffered:true});}catch{}
- });
+ },{dangerous:consequential.source});
  await context.route('**/*',async route=>{const r=route.request();if(!['GET','HEAD','OPTIONS'].includes(r.method())){add('skipped',`${r.method()} request blocked`,{url:r.url(),step:activeStep});issue('review','blocked_submission','A form or state-changing request needs manual review',r.url(),activeStep);return route.abort('blockedbyclient');}return route.continue();});
  await context.routeWebSocket('**/*',ws=>{add('skipped','WebSocket connection not exercised',{url:ws.url(),step:activeStep});issue('review','websocket','Real-time WebSocket behavior needs manual review',ws.url(),activeStep);ws.close();});
- const requestStarts=new WeakMap(),requestSteps=new WeakMap(),requestFroms=new WeakMap();
+ const requestStarts=new WeakMap(),requestSteps=new WeakMap(),requestFroms=new WeakMap(),navigationStarted=new Set();
+ const topNavigation=r=>{try{return r.isNavigationRequest()&&!r.frame().parentFrame();}catch{return r.isNavigationRequest();}};
+  context.on('requestfailed',r=>{const msg=r.failure()?.errorText||'Network request failed';add('network_error',msg,{url:r.url(),resource:r.resourceType(),step:activeStep});if(!/ERR_ABORTED|BLOCKED_BY_CLIENT/.test(msg))issue(topNavigation(r)?'error':'warning','network_error',msg,r.url(),activeStep);});
+  context.on('request',r=>{requestStarts.set(r,Date.now());requestSteps.set(r,activeStep);if(topNavigation(r))navigationStarted.add(activeStep);if(r.isNavigationRequest()&&!r.redirectedFrom()){try{requestFroms.set(r,r.frame().page().url());}catch{}}add('request',r.method()+' '+r.url(),{url:r.url(),resource:r.resourceType(),step:activeStep});});
+  context.on('response',r=>{const req=r.request();let mainNavigation=false;try{mainNavigation=req.isNavigationRequest()&&!req.frame().parentFrame();}catch{mainNavigation=req.isNavigationRequest();}
+   const from=requestFroms.get(req);
+   if(mainNavigation&&requestSteps.get(req)==='Destination'&&from&&from!=='about:blank'&&from!==r.url()&&run.redirects.length<100)run.redirects.push({kind:'page_navigation',from,to:r.url(),status:r.status(),duration_ms:Math.max(0,Date.now()-(requestStarts.get(req)||Date.now())),at:Date.now()-start,step:'Destination'});
+   if(mainNavigation&&r.status()>=300&&r.status()<400){
+    const location=r.headers()['location'];if(location&&run.redirects.length<100)try{run.redirects.push({from:r.url(),to:new URL(location,r.url()).href,status:r.status(),duration_ms:Math.max(0,Date.now()-(requestStarts.get(req)||Date.now())),at:Date.now()-start,step:requestSteps.get(req)||activeStep});}catch{}
+   }
+   add('response',String(r.status()),{url:r.url(),status:r.status(),resource:req.resourceType(),step:activeStep});if(r.status()>=400)issue(mainNavigation?'error':'warning','http_'+r.status(),'HTTP '+r.status(),r.url(),activeStep);});
  const attach=p=>{
   p.on('console',m=>{if(['error','warning'].includes(m.type())){add('console',m.text(),{level:m.type(),url:p.url(),step:activeStep});issue('warning','console_'+m.type(),m.text(),p.url(),activeStep);}});
   p.on('pageerror',e=>{add('javascript',e.message,{url:p.url(),step:activeStep});issue('warning','javascript_error',e.message,p.url(),activeStep);});
-  p.on('requestfailed',r=>{const msg=r.failure()?.errorText||'Network request failed';add('network_error',msg,{url:r.url(),resource:r.resourceType(),step:activeStep});if(!/ERR_ABORTED|BLOCKED_BY_CLIENT/.test(msg))issue(r.isNavigationRequest()?'error':'warning','network_error',msg,r.url(),activeStep);});
-  p.on('request',r=>{requestStarts.set(r,Date.now());requestSteps.set(r,activeStep);if(r.isNavigationRequest()&&!r.redirectedFrom())requestFroms.set(r,p.url());add('request',r.method()+' '+r.url(),{url:r.url(),resource:r.resourceType(),step:activeStep});});
-  p.on('response',r=>{const req=r.request();
-   const from=requestFroms.get(req);
-   if(req.isNavigationRequest()&&req.frame()===p.mainFrame()&&requestSteps.get(req)==='Destination'&&from&&from!=='about:blank'&&from!==r.url()&&run.redirects.length<100)run.redirects.push({kind:'page_navigation',from,to:r.url(),status:r.status(),duration_ms:Math.max(0,Date.now()-(requestStarts.get(req)||Date.now())),at:Date.now()-start,step:'Destination'});
-   if(req.isNavigationRequest()&&req.frame()===p.mainFrame()&&r.status()>=300&&r.status()<400){
-    const location=r.headers()['location'];if(location&&run.redirects.length<100)try{run.redirects.push({from:r.url(),to:new URL(location,r.url()).href,status:r.status(),duration_ms:Math.max(0,Date.now()-(requestStarts.get(req)||Date.now())),at:Date.now()-start,step:requestSteps.get(req)||activeStep});}catch{}
-   }
-   add('response',String(r.status()),{url:r.url(),status:r.status(),resource:req.resourceType(),step:activeStep});if(r.status()>=400)issue(req.isNavigationRequest()?'error':'warning','http_'+r.status(),'HTTP '+r.status(),r.url(),activeStep);});
   p.on('framenavigated',f=>{if(f===p.mainFrame())add('navigation',f.url(),{url:f.url(),step:activeStep});});
   p.on('dialog',d=>{issue('review','dialog','Page opened a '+d.type()+' dialog: '+d.message(),p.url(),activeStep);void d.dismiss();});
   p.on('download',d=>{issue('review','download','Download requires manual review: '+d.suggestedFilename(),p.url(),activeStep);void d.cancel();});
@@ -57,14 +66,19 @@ export async function probe(browser,monitor,egress,artifactDir){
   const candidates=els.map((e,index)=>{
    const explicit=e.matches('a,button,[role="button"],[role="link"],input[type="submit"],input[type="button"],[onclick],[ng-click],[data-ng-click]');
    const style=getComputedStyle(e),rect=e.getBoundingClientRect(),label=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('value')||e.getAttribute('title')||'Unlabelled control').trim().slice(0,140);
-   const eligible=explicit||style.cursor==='pointer'&&label!=='Unlabelled control'&&(e.innerText||'').length<=140;
-   return {element:e,index,label,href:e.href||'',tag:e.tagName,type:e.type||'',form:!!(e.form||e.closest('form')),submits:!!e.form&&['submit','image'].includes(e.type),download:e.hasAttribute('download'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true',visible:!!(rect.width&&rect.height)&&style.visibility!=='hidden'&&style.display!=='none',eligible,explicit};
+   let container=e.parentElement,contextLabel='';for(let depth=0;container&&depth<4;depth++,container=container.parentElement){const text=(container.innerText||'').trim().replace(/\s+/g,' ');if(text&&text!==label&&text.length<=1000){contextLabel=text.slice(0,400);break;}}
+   const identity=e.id||e.getAttribute('data-offer-id')||e.getAttribute('data-study-id')||e.getAttribute('data-id')||e.getAttribute('onclick')||'';
+   const semantic=e.matches('a,button,input,[role=button],[role=link]');
+   const eligible=explicit||style.cursor==='pointer'&&(!e.parentElement||getComputedStyle(e.parentElement).cursor!=='pointer'||e.getAttribute('tabindex')==='0')&&label!=='Unlabelled control'&&(e.innerText||'').length<=140;
+   return {element:e,index,label,identity,contextLabel,semantic,href:e.href||'',tag:e.tagName,type:e.type||'',form:!!(e.form||e.closest('form')),submits:!!e.form&&['submit','image'].includes(e.type),download:e.hasAttribute('download'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true',visible:!!(rect.width&&rect.height)&&style.visibility!=='hidden'&&style.display!=='none',eligible,explicit};
   }).filter(c=>c.visible&&c.eligible&&!c.element.matches('select,textarea,input:not([type="button"]):not([type="submit"])'));
   // Ignore decorative descendants of semantic controls, and pointer-style wrappers.
-  return candidates.filter(c=>!candidates.some(other=>other!==c&&((other.explicit&&other.element.contains(c.element))||(!c.explicit&&c.element.contains(other.element))))).map(({element,visible,eligible,explicit,...c})=>c);
+  const found=candidates.filter(c=>!candidates.some(other=>other!==c&&((other.semantic&&other.element.contains(c.element))||(!c.semantic&&c.element.contains(other.element))))).map(({element,visible,eligible,explicit,semantic,...c})=>c);
+  return found.map(c=>{const peers=found.filter(x=>x.label===c.label&&x.href===c.href&&x.tag===c.tag&&x.type===c.type&&x.identity===c.identity&&x.contextLabel===c.contextLabel);return {...c,occurrence:peers.indexOf(c),duplicates:peers.length};});
  });
  const resolve=async(p,c)=>{
-  const matches=(await controls(p)).filter(x=>x.label===c.label&&x.href===c.href&&x.tag===c.tag&&x.type===c.type);
+  let matches=(await controls(p)).filter(x=>x.label===c.label&&x.href===c.href&&x.tag===c.tag&&x.type===c.type&&x.identity===c.identity&&x.contextLabel===c.contextLabel);
+  if(matches.length>1&&matches.length===c.duplicates)matches=[matches[c.occurrence]];
   if(matches.length!==1)throw new Error(matches.length?'Control is ambiguous after the page changed':'Control is no longer available');
   if(!canNavigate(matches[0]))throw new Error('Control is no longer eligible for navigation');
   return p.locator(selector).nth(matches[0].index);
@@ -79,7 +93,7 @@ export async function probe(browser,monitor,egress,artifactDir){
   const next=context.pages().find(x=>!oldPages.has(x)&&!x.isClosed())||p;
   await settle(next);return next;
  };
- const screenshot=async(p,name)=>{try{const filename=run.id+'-'+run.artifacts.length+'.png';await p.screenshot({path:artifactDir+'/'+filename,fullPage:false,timeout:5000});run.artifacts.push({filename,label:name});}catch(e){add('artifact_error',e.message);}};
+ const screenshot=async(p,name)=>{try{const filename=run.id+'-'+run.artifacts.length+'.png';await p.screenshot({path:artifactDir+'/'+filename,fullPage:false,timeout:5000});run.artifacts.push({filename,label:name,url:p.url(),step:activeStep});}catch(e){add('artifact_error',e.message);}};
  try{
   page=await context.newPage();add('start','Loading source URL',{url:monitor.source});
   await page.goto(monitor.source,{waitUntil:'domcontentloaded',timeout});await settle(page);
@@ -121,6 +135,7 @@ export async function probe(browser,monitor,egress,artifactDir){
      if(i>0){try{await replay(path);}catch(e){stop('replay_failed',page,depth,parentStep,'Could not return to this branch: '+e.message);issue('review','replay_failed','Branch could not be restored: '+e.message,page.url(),'Returning to branch');return;}}
      const c=eligible[i],step={index:run.steps.length+1,parentStep,path:[...path.map(c=>c.label),c.label],label:c.label,from:page.url(),to:'',status:'passed',duration_ms:0,depth:depth+1};
      activeStep='Click '+step.index+': '+c.label;const began=Date.now(),before=await state(page),priorIssues=run.issues.length;let changed=false;
+     step.expectedNavigation=!!c.href&&/^https?:/i.test(c.href)&&c.href.split('#')[0]!==before.url.split('#')[0]||/^(next|continue|start|get started|learn more|view|show|read|open|see|explore)\b/i.test(c.label);
      run.coverage.attempted++;run.steps.push(step);
      try{
       page=await click(page,c);step.to=page.url();step.metrics=await inspect(page);
@@ -128,15 +143,29 @@ export async function probe(browser,monitor,egress,artifactDir){
       if(blockedForms.length){step.status='review';issue('review','form_submission_blocked','This control attempted to submit a form. Its click handler was exercised, but submission was stopped.',step.to,activeStep);add('skipped','Form submission prevented',{reason:'form_submission',step:activeStep});}
 
       const after=await state(page);step.newDocument=before.timeOrigin!==after.timeOrigin;changed=before.url!==after.url||before.text!==after.text;
-      if(!changed&&Math.abs(after.scroll-before.scroll)<20){if(!blockedForms.length)step.status='warning';issue(blockedForms.length?'review':'warning',blockedForms.length?'submission_required':'no_visible_effect','Click produced no observable navigation, content, or scroll change: '+c.label,step.from,activeStep);stop(blockedForms.length?'submission_required':'no_visible_effect',page,depth+1,step.index,blockedForms.length?'Continuing requires a form submission, which was prevented.':'Click had no visible effect; this branch was not followed further.');}
-      else if(!changed)stop('scroll_only',page,depth+1,step.index,'Click scrolled the page without opening a new page state.');
-      if(run.issues.slice(priorIssues).some(i=>i.severity==='error'))step.status='failed';
-      else if(run.issues.slice(priorIssues).some(i=>i.severity==='warning'))step.status='warning';
-     }catch(e){step.status='failed';step.to=page.url();issue('error','click_failed',c.label+': '+e.message,step.from,activeStep);stop('click_failed',page,depth+1,step.index,'Control could not be clicked: '+e.message);}
+      step.navigationAttempted=navigationStarted.has(activeStep);
+      if(!changed&&Math.abs(after.scroll-before.scroll)<20){
+       if(blockedForms.length||step.expectedNavigation){step.status=blockedForms.length?'review':'warning';issue(blockedForms.length?'review':'warning',blockedForms.length?'submission_required':'no_visible_effect','No navigation was observed after '+c.label,step.from,activeStep);}
+       else add('in_page','No redirect expected or observed: '+c.label,{step:activeStep,url:step.to});
+       stop(blockedForms.length?'submission_required':step.expectedNavigation?'no_visible_effect':'in_page_only',page,depth+1,step.index,blockedForms.length?'Continuing requires a form submission, which was prevented.':step.expectedNavigation?'No navigation was observed; review this control.':'In-page interaction; no redirect was expected or observed.');
+      }else if(!changed)stop('scroll_only',page,depth+1,step.index,'Click scrolled the page without opening a new page state.');
+      const findings=run.issues.slice(priorIssues);
+      const navigationError=findings.some(i=>i.severity==='error'&&(/^(http_|network_error)/.test(i.code)));
+      const timedOut=findings.some(i=>i.code==='load_timeout');
+      const noDestination=!/^https?:/i.test(step.to)||!after.text.trim()||(step.to===step.from&&!step.newDocument);
+      if(step.navigationAttempted&&(navigationError||timedOut||noDestination)){
+       step.status='failed';step.failureKind='redirect';
+       issue('error','redirect_failed',timedOut?'Redirect destination timed out':noDestination?'Redirect did not reach a usable destination page':'Redirect destination returned an HTTP or network error',step.to,activeStep);
+      }else if(findings.some(i=>i.severity==='warning')&&step.status==='passed')step.status='warning';
+     }catch(e){
+      step.navigationAttempted=navigationStarted.has(activeStep);step.status=step.navigationAttempted?'failed':'review';step.failureKind=step.navigationAttempted?'redirect':undefined;step.to=page.url();
+      issue(step.navigationAttempted?'error':'review',step.navigationAttempted?'redirect_failed':'control_not_tested',c.label+': '+e.message,step.from,activeStep);
+      stop(step.navigationAttempted?'redirect_failed':'control_not_tested',page,depth+1,step.index,step.navigationAttempted?'Redirect did not complete: '+e.message:'Control could not be tested reliably; no redirect failure was observed.');
+     }
      step.duration_ms=Date.now()-began;add('click',c.label,step);
-     if(step.status==='passed')run.coverage.passed++;else run.coverage.failed++;
+     if(step.status==='passed')run.coverage.passed++;else if(step.status==='failed')run.coverage.failed++;else if(step.status==='warning')run.coverage.warnings++;else run.coverage.reviewed++;
      run.coverage.depthReached=Math.max(run.coverage.depthReached,step.depth);
-     await screenshot(page,'Step '+step.index+' · Depth '+step.depth+' · '+c.label);
+     if(step.navigationAttempted||step.newDocument||step.from.split('#')[0]!==step.to.split('#')[0])await screenshot(page,(step.failureKind==='redirect'?'Failed redirect':'Lander')+' after step '+step.index+' · '+c.label);
      if(changed&&step.status!=='failed')await walk([...path,c],step.index);
     }
    };
